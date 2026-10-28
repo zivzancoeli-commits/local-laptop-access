@@ -1,0 +1,16 @@
+{
+  "env": {
+    "PATH": "$(PATH):$(HOME)/.local/bin"
+  },
+  "apps": [
+    {
+      "name": "Desktop",
+      "prep-cmd": [
+        {
+          "do": "/bin/bash __HOME__/.config/sunshine/stream-session.sh start",
+          "undo": "/bin/bash __HOME__/.config/sunshine/stream-session.sh stop"
+        }
+      ]
+    }
+  ]
+}

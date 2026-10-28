@@ -1,0 +1,77 @@
+#!/bin/bash
+set -euo pipefail
+
+# shellcheck disable=SC1091
+. "$HOME/.config/moonlight-web/bin/load-host-settings.sh"
+
+LOGIN="$HOME/Desktop/Stream/login.txt"
+PLIST="$HOME/Library/LaunchAgents/dev.moonlight.web.plist"
+UID_NUM="$(id -u)"
+LABEL="gui/${UID_NUM}/dev.moonlight.web"
+BIN="$HOME/.config/moonlight-web/bin"
+DIR="$HOME/.config/moonlight-web"
+
+if [ -f "$LOGIN" ]; then
+  python3 "$BIN/apply-login" "$LOGIN"
+fi
+
+if [ -x "$HOME/.config/sunshine/keep-lid-awake" ]; then
+  "$HOME/.config/sunshine/keep-lid-awake" start || true
+fi
+
+if [ -x "$BIN/nearby-link" ]; then
+  "$BIN/nearby-link" stop >/dev/null 2>&1 || true
+fi
+if [ -x "$BIN/net-fallback" ]; then
+  "$BIN/net-fallback" stop >/dev/null 2>&1 || true
+fi
+ifconfig awdl0 down >/dev/null 2>&1 || true
+ifconfig llw0 down >/dev/null 2>&1 || true
+
+if [ -x "$BIN/direct-link" ]; then
+  "$BIN/direct-link" start >/dev/null 2>&1 || true
+fi
+if [ -x "$BIN/lan-dns-ctl" ]; then
+  "$BIN/lan-dns-ctl" stop >/dev/null 2>&1 || true
+fi
+
+url="$WEB_URL"
+if [ -x "$BIN/wifi-link" ] && [ "$("$BIN/wifi-link" still-up 2>/dev/null || true)" != "yes" ]; then
+  url="$("$BIN/stream-addresses" --wait 8 --url 2>/dev/null || true)"
+fi
+if [ -z "$url" ]; then
+  url="http://127.0.0.1:${WEB_PORT}${WEB_PATH}"
+fi
+printf '%s\n' "$url" > "$DIR/stream-url.txt"
+
+osascript -e 'tell application "Sunshine" to quit' >/dev/null 2>&1 &
+quit_pid=$!
+sleep 1
+kill "$quit_pid" >/dev/null 2>&1 || true
+
+if ! osascript -e 'tell application "System Events" to get the name of every login item' 2>/dev/null | grep -q "Sunshine"; then
+  osascript -e 'tell application "System Events" to make login item at end with properties {path:"/Applications/Sunshine.app", hidden:true}' >/dev/null
+fi
+
+open -a Sunshine
+
+if launchctl print "$LABEL" >/dev/null 2>&1; then
+  launchctl kickstart -k "$LABEL"
+else
+  launchctl bootstrap "gui/${UID_NUM}" "$PLIST"
+fi
+
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  local_url="http://127.0.0.1:${WEB_PORT}${WEB_PATH}"
+  if curl -4 -g -sS -o /dev/null --connect-timeout 1 --max-time 3 "$url" || curl -4 -sS -o /dev/null --connect-timeout 1 --max-time 3 "$local_url"; then
+    if [ -x "$BIN/wifi-link" ] && [ "$("$BIN/wifi-link" still-up 2>/dev/null || true)" = "yes" ]; then
+      echo "Stream is on. Join Wi-Fi ${SSID}, password ${PASSWORD}, then open ${WEB_URL}. Log in as ${WEB_USER} / ${WEB_PASSWORD}. Click Turn Off when this Mac should sleep."
+    else
+      echo "Stream is on. On the other computer open ${url}"
+    fi
+    exit 0
+  fi
+  sleep 1
+done
+
+echo "Sunshine and the web client were started. If the other computer cannot connect yet, wait a few seconds and open ${url}"

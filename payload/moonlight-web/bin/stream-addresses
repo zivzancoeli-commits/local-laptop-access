@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""Pick a local stream URL. Never use a public IPv4 or cellular CLAT IP."""
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import subprocess
+import sys
+import time
+
+SKIP_PREFIXES = ("127.", "169.254.", "192.0.0.")
+HOTSPOT_PREFIXES = (
+    ("172.20.10.", "iphone-hotspot", 90),
+    ("172.20.20.", "iphone-hotspot", 90),
+    ("192.168.43.", "phone-hotspot", 85),
+    ("192.168.137.", "phone-hotspot", 85),
+    ("192.168.173.", "phone-hotspot", 85),
+    ("10.0.2.", "mac-hotspot", 80),
+    ("192.168.2.", "mac-hotspot", 80),
+    ("10.10.10.", "cable", 100),
+)
+
+
+def wifi_ssid() -> str:
+    try:
+        text = subprocess.check_output(
+            ["networksetup", "-getairportnetwork", "en0"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+    if "not associated" in text.lower():
+        return ""
+    prefix = "Current Wi-Fi Network: "
+    if prefix in text:
+        return text.split(prefix, 1)[1].strip()
+    return text.strip()
+
+
+def ifconfig_text() -> str:
+    try:
+        return subprocess.check_output(["ifconfig"], text=True, errors="replace")
+    except OSError:
+        return ""
+
+
+def ipv4s() -> list[tuple[str, str]]:
+    iface = ""
+    found: list[tuple[str, str]] = []
+    for line in ifconfig_text().splitlines():
+        if line and not line[0].isspace() and ":" in line:
+            iface = line.split(":", 1)[0]
+            continue
+        stripped = line.strip()
+        if stripped.startswith("inet "):
+            ip = stripped.split()[1]
+            if any(ip.startswith(prefix) for prefix in SKIP_PREFIXES):
+                continue
+            found.append((iface, ip))
+    return found
+
+
+def ipv6s() -> list[tuple[str, str, str]]:
+    """Return (iface, ip, flags) for global or unique-local IPv6 addresses."""
+    iface = ""
+    found: list[tuple[str, str, str]] = []
+    for line in ifconfig_text().splitlines():
+        if line and not line[0].isspace() and ":" in line:
+            iface = line.split(":", 1)[0]
+            continue
+        stripped = line.strip()
+        if not stripped.startswith("inet6 "):
+            continue
+        ip = stripped.split()[1].split("%", 1)[0]
+        flags = stripped
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if addr.version != 6 or addr.is_loopback or addr.is_multicast:
+            continue
+        if "clat46" in flags:
+            continue
+        if addr.is_link_local and iface not in {"awdl0", "llw0"}:
+            continue
+        found.append((iface, ip, flags))
+    return found
+
+
+def classify_v4(iface: str, ip: str) -> tuple[str, int]:
+    if iface == "ap1" and ip.startswith("192.168.2."):
+        return "mac-hotspot", 110
+    if iface.startswith("bridge"):
+        return "mac-hotspot", 95
+    for prefix, kind, score in HOTSPOT_PREFIXES:
+        if ip.startswith(prefix):
+            return kind, score
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return "skip", 0
+    if addr.is_private and not addr.is_loopback and not addr.is_link_local:
+        return "lan", 40
+    return "skip", 0
+
+
+def classify_v6(iface: str, ip: str, flags: str) -> tuple[str, int]:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return "skip", 0
+    if addr.version != 6:
+        return "skip", 0
+    if iface in {"awdl0", "llw0"}:
+        return "nearby", 35
+    kind = "hotspot-ipv6" if iface in {"en0", "en1"} else "ipv6"
+    # Prefer the stable SLAAC address over a rotating privacy address.
+    if "secured" in flags:
+        return kind, 25
+    if "temporary" in flags:
+        return kind, 15
+    if addr.is_private:
+        return kind, 30
+    return kind, 20
+
+
+def format_url(ip: str) -> str:
+    addr = ipaddress.ip_address(ip)
+    if addr.version == 6:
+        return f"http://[{ip}]:8080"
+    return f"http://{ip}:8080"
+
+
+def ranked_v4() -> list[tuple[int, str, str, str]]:
+    rows: list[tuple[int, str, str, str]] = []
+    for iface, ip in ipv4s():
+        kind, score = classify_v4(iface, ip)
+        if score <= 0:
+            continue
+        rows.append((score, kind, iface, ip))
+    rows.sort(key=lambda item: (-item[0], item[3]))
+    return rows
+
+
+def ranked_v6() -> list[tuple[int, str, str, str]]:
+    rows: list[tuple[int, str, str, str]] = []
+    for iface, ip, flags in ipv6s():
+        kind, score = classify_v6(iface, ip, flags)
+        if score <= 0:
+            continue
+        rows.append((score, kind, iface, ip))
+    rows.sort(key=lambda item: (-item[0], item[3]))
+    return rows
+
+
+def ranked() -> list[tuple[int, str, str, str]]:
+    rows = ranked_v4()
+    # IPv6 only when there is no usable private IPv4.
+    if not rows:
+        rows = ranked_v6()
+    return rows
+
+
+def best(wait: float = 0) -> tuple[str, str, str] | None:
+    # iPhone Maximize Compatibility can stay on fake 192.0.0.2 for ~20s
+    # before DHCP gives 172.20.10.x. Wait for IPv4 so Show Link is usable
+    # on a PC that has no IPv6.
+    deadline = time.time() + max(wait, 0)
+    fallback: tuple[str, str, str] | None = None
+    while True:
+        v4 = ranked_v4()
+        if v4:
+            _score, kind, iface, ip = v4[0]
+            return kind, iface, ip
+        v6 = ranked_v6()
+        if v6:
+            _score, kind, iface, ip = v6[0]
+            fallback = kind, iface, ip
+        if time.time() >= deadline:
+            return fallback
+        time.sleep(0.4)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--url", action="store_true")
+    parser.add_argument("--kind", action="store_true")
+    parser.add_argument("--wait", type=float, default=0, help="seconds to wait for a private IPv4")
+    args = parser.parse_args()
+    choice = best(wait=args.wait)
+    if args.url:
+        if not choice:
+            sys.exit(1)
+        print(format_url(choice[2]))
+        return
+    if args.kind:
+        print(choice[0] if choice else "none")
+        return
+    if not choice:
+        sys.exit(1)
+    kind, iface, ip = choice
+    print(kind)
+    print(iface)
+    print(ip)
+    print(wifi_ssid())
+    print(format_url(ip))
+    for _score, row_kind, row_iface, row_ip in ranked():
+        print(f"{row_ip}\t{row_iface}\t{row_kind}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,774 @@
+#!/bin/bash
+# Root helper: host or stop the local Eli-internet Wi-Fi using macOS's
+# own Network Sharing job (not a copy of InternetSharing).
+set -u
+
+console_home() {
+  if [ "$(id -u)" -eq 0 ]; then
+    local name dir
+    name="$(/usr/bin/stat -f %Su /dev/console 2>/dev/null || true)"
+    case "$name" in
+      ""|root|loginwindow) ;;
+      *)
+        dir="$(/usr/bin/dscl . -read "/Users/${name}" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')"
+        if [ -n "$dir" ]; then
+          printf '%s\n' "$dir"
+          return 0
+        fi
+        ;;
+    esac
+  fi
+  printf '%s\n' "${HOME:-/var/root}"
+}
+
+HOME_DIR="$(console_home)"
+CONFIG_DIR="${ELI_CONFIG_DIR:-$HOME_DIR/.config/moonlight-web}"
+BIN="${ELI_BIN:-$CONFIG_DIR/bin}"
+SSID="host-internet"
+PASSWORD="Password123"
+WEB_URL="http://192.168.2.1:8080"
+WEB_PORT="8080"
+WEB_PATH=""
+
+load_settings() {
+  SSID="host-internet"
+  PASSWORD="Password123"
+  WEB_URL="http://192.168.2.1:8080"
+  WEB_PORT="8080"
+  WEB_PATH=""
+  if [ -f "$CONFIG_DIR/host-settings.json" ] && [ -f "$BIN/host-settings.py" ]; then
+    settings_shell="$(python3 "$BIN/host-settings.py" shell "$CONFIG_DIR/host-settings.json" 2>/dev/null || true)"
+    if [ -n "$settings_shell" ]; then
+      eval "$settings_shell"
+    fi
+  fi
+}
+
+load_settings
+LOG="$CONFIG_DIR/logs/wifi-link.log"
+WANT="$CONFIG_DIR/wifi-link.want"
+OWNED="$CONFIG_DIR/wifi-link.owned"
+SWITCH="$CONFIG_DIR/eli-switch.command"
+STATUS="$CONFIG_DIR/eli-switch.status"
+PIDFILE="$CONFIG_DIR/eli-switch.pid"
+NAT_PLIST="/Library/Preferences/SystemConfiguration/com.apple.nat.plist"
+INSTALL_DIR="/Library/Application Support/moonlight-web"
+INSTALL_BIN="$INSTALL_DIR/eli-internet-root"
+DAEMON_PLIST="/Library/LaunchDaemons/dev.moonlight.eli-internet.plist"
+DAEMON_LABEL="dev.moonlight.eli-internet"
+SHARING_LABEL="system/com.apple.NetworkSharing"
+
+mkdir -p "$CONFIG_DIR/logs" 2>/dev/null || true
+
+log() {
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG" 2>/dev/null || true
+}
+
+write_status() {
+  printf '%s\n' "$1" >"$STATUS" 2>/dev/null || true
+  chmod 644 "$STATUS" 2>/dev/null || true
+}
+
+wifi_device() {
+  /usr/sbin/networksetup -listallhardwareports 2>/dev/null | awk '
+    /Wi-Fi|AirPort/ { getline; print $2; exit }
+  '
+}
+
+ap_up() {
+  # Hosting is the radio in host mode. A leftover 192.168.2.1 on ap1 still
+  # looks assigned after the radio rejoins the house network.
+  if [ -x "$BIN/eli-host" ] && "$BIN/eli-host" roles 2>/dev/null | grep -Eq "default name=en0 mode=3|role1 name=en0 mode=3|role3 name=ap1 mode=3"; then
+    return 0
+  fi
+  if ifconfig ap1 2>/dev/null | grep -q "inet 192.168.2." \
+    && ifconfig ap1 2>/dev/null | grep -q "status: active" \
+    && ifconfig en0 2>/dev/null | grep -q "status: inactive"; then
+    return 0
+  fi
+  return 1
+}
+
+usb_ipv6() {
+  ifconfig en7 2>/dev/null | awk '/inet6 2607:/{print $2; exit}'
+}
+
+usb_ready() {
+  ifconfig en7 2>/dev/null | grep -q "inet 192.0.0.2" && return 0
+  [ -n "$(usb_ipv6)" ]
+}
+
+restore_phone() {
+  if usb_ready; then
+    return 0
+  fi
+  pkill -f "$BIN/direct-dhcp" >/dev/null 2>&1 || true
+  if ifconfig en7 2>/dev/null | grep -q "inet 10.10.10.1"; then
+    ifconfig en7 inet 10.10.10.1 delete >/dev/null 2>&1 || true
+  fi
+  local saved
+  saved="$(/usr/sbin/networksetup -getinfo "iPhone USB" 2>/dev/null | awk -F': ' '/^IP address:/{print $2; exit}')"
+  if [ "$saved" = "192.0.0.2" ]; then
+    ifconfig en7 inet 192.0.0.2 netmask 255.255.255.255 up >/dev/null 2>&1 || true
+    if usb_ready; then
+      rm -f "$CONFIG_DIR/direct-link.state"
+      return 0
+    fi
+  fi
+  /usr/sbin/networksetup -setdhcp "iPhone USB" >/dev/null 2>&1 || true
+  ipconfig set en7 DHCP >/dev/null 2>&1 || true
+  local i
+  for i in 1 2 3 4 5 6 7 8; do
+    if usb_ready; then
+      rm -f "$CONFIG_DIR/direct-link.state"
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+route_iface() {
+  route -n get 1.1.1.1 2>/dev/null | awk '/interface:/{print $2; exit}'
+}
+
+bring_up_usb() {
+  # A DHCP renew drops a working 192.0.0.2 for a few seconds, and the
+  # cable check then fails even though the phone is already online.
+  if ifconfig en7 2>/dev/null | grep -q "inet 192.0.0.2"; then
+    return 0
+  fi
+  /usr/sbin/networksetup -setdhcp "iPhone USB" >/dev/null 2>&1 || true
+  ipconfig set en7 DHCP >/dev/null 2>&1 || true
+  local i prefix id router addr
+  for i in 1 2 3 4; do
+    if usb_ready; then
+      break
+    fi
+    sleep 1
+  done
+  if [ -z "$(usb_ipv6)" ]; then
+    prefix="$(ipconfig getsummary en7 2>/dev/null | sed -n 's/.*\(2607:[0-9a-f:]*\)::\/64.*/\1/p' | head -1)"
+    id="$(ifconfig en7 2>/dev/null | awk '/inet6 fe80:/{print $2; exit}')"
+    id="${id#fe80::}"
+    id="${id%%\%*}"
+    if [ -n "$prefix" ] && [ -n "$id" ]; then
+      ifconfig en7 inet6 "${prefix}:${id}" prefixlen 64 alias >/dev/null 2>&1 || \
+        ifconfig en7 inet6 "${prefix}:${id}" prefixlen 64 >/dev/null 2>&1 || true
+    fi
+  fi
+  router="$(ipconfig getsummary en7 2>/dev/null | sed -n 's/.*from \(fe80:[^ ,]*\).*/\1/p' | head -1)"
+  if [ -n "$router" ]; then
+    route -n add -inet6 default "${router}%en7" >/dev/null 2>&1 || true
+  fi
+  addr="$(usb_ipv6)"
+  if [ -z "$addr" ] && ! ifconfig en7 2>/dev/null | grep -q "inet 192.0.0.2"; then
+    return 1
+  fi
+  return 0
+}
+
+cable_ok() {
+  python3 - <<'PY'
+import socket
+import subprocess
+import sys
+
+IPV6_BOUND_IF = 125
+IP_BOUND_IF = 25
+
+def bound_connect(family, bound_opt, src, dest):
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    sock.settimeout(4)
+    try:
+        idx = socket.if_nametoindex("en7")
+        sock.setsockopt(socket.IPPROTO_IPV6 if family == socket.AF_INET6 else socket.IPPROTO_IP, bound_opt, idx)
+        if src:
+            sock.bind((src, 0))
+        sock.connect((dest, 443))
+        peer = sock.getpeername()[0]
+        # A content filter accepts this on 127.0.0.1. That is not the phone cable.
+        if peer in ("127.0.0.1", "::1") or peer.startswith("127."):
+            return False
+        return True
+    except Exception:
+        return False
+    finally:
+        sock.close()
+
+if bound_connect(socket.AF_INET, IP_BOUND_IF, "192.0.0.2", "1.1.1.1"):
+    sys.exit(0)
+src6 = ""
+for line in subprocess.check_output(["ifconfig", "en7"], text=True, errors="replace").splitlines():
+    parts = line.split()
+    if len(parts) >= 2 and parts[0] == "inet6" and parts[1].startswith("2607:"):
+        src6 = parts[1].split("%")[0]
+        break
+if src6 and bound_connect(socket.AF_INET6, IPV6_BOUND_IF, src6, "2606:4700:4700::1111"):
+    sys.exit(0)
+sys.exit(1)
+PY
+}
+
+prefer_usb_route() {
+  bring_up_usb || true
+  if ! cable_ok; then
+    # The phone can keep 192.0.0.2 after the cable stops passing traffic.
+    ipconfig set en7 DHCP >/dev/null 2>&1 || true
+    local i
+    for i in 1 2 3 4 5 6 7 8; do
+      if ifconfig en7 2>/dev/null | grep -q "inet 192.0.0.2"; then
+        break
+      fi
+      sleep 1
+    done
+  fi
+  if ! cable_ok; then
+    echo "The phone cable is not sharing internet, so this Mac's Wi-Fi was left as it is."
+    return 1
+  fi
+  if ifconfig en7 2>/dev/null | grep -q "inet 192.0.0.2"; then
+    route -n add -host 192.0.0.1 -interface en7 >/dev/null 2>&1 || true
+    route -n delete default >/dev/null 2>&1 || true
+    route -n add default 192.0.0.1 >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+restore_house_route() {
+  local ip i dev
+  dev="$(wifi_device)"
+  [ -n "$dev" ] || dev="en0"
+  /usr/sbin/networksetup -setairportpower "$dev" on >/dev/null 2>&1 || true
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    ip="$(ipconfig getifaddr en0 2>/dev/null || true)"
+    case "$ip" in
+      192.168.0.*)
+        route -n delete default >/dev/null 2>&1 || true
+        route -n add default 192.168.0.1 >/dev/null 2>&1 || true
+        return 0
+        ;;
+    esac
+    sleep 1
+  done
+}
+
+write_nat_plist() {
+  export HOST_SSID="$SSID" HOST_PASSWORD="$PASSWORD"
+  if [ -x "$BIN/write-nat-plist" ]; then
+    python3 "$BIN/write-nat-plist" "$CONFIG_DIR/com.apple.nat.eli-internet.plist" >/dev/null
+    return
+  fi
+  python3 - "$CONFIG_DIR/com.apple.nat.eli-internet.plist" <<'PY'
+import os, plistlib, re, subprocess, sys
+from pathlib import Path
+dest = Path(sys.argv[1])
+sid, device, hardware = "2F6DFBB2-7056-4171-9839-333336CE37B6", "bridge0", ""
+try:
+    prefs = plistlib.loads(Path("/Library/Preferences/SystemConfiguration/preferences.plist").read_bytes())
+    for key, svc in (prefs.get("NetworkServices") or {}).items():
+        name = svc.get("UserDefinedName") or ""
+        iface = svc.get("Interface") or {}
+        if name == "Thunderbolt Bridge" or iface.get("UserDefinedName") == "Thunderbolt Bridge":
+            sid = key
+            device = iface.get("DeviceName") or iface.get("Device") or "bridge0"
+            hardware = iface.get("HardwareAddress") or ""
+            break
+except Exception:
+    pass
+if not hardware:
+    try:
+        text = subprocess.check_output(["networksetup", "-getmacaddress", "Thunderbolt Bridge"], text=True)
+        match = re.search(r"((?:[0-9a-f]{2}:){5}[0-9a-f]{2})", text, re.I)
+        if match:
+            hardware = match.group(1)
+    except Exception:
+        hardware = ""
+data = {
+    "NAT": {
+        "Enabled": 1,
+        "NatPortMapDisabled": True,
+        "PrimaryService": sid,
+        "PrimaryInterface": {
+            "Device": device,
+            "Enabled": 1,
+            "HardwareID": hardware,
+            "PrimaryUserReadable": "Thunderbolt Bridge",
+        },
+        "AirPort": {
+            "Enabled": 1,
+            "Channel": 6,
+            "NetworkName": os.environ.get("HOST_SSID", "host-internet"),
+            "NetworkPassword": os.environ.get("HOST_PASSWORD", "Password123"),
+        },
+        "SharingNetworkNumberStart": "192.168.2.1",
+        "SharingNetworkNumberEnd": "192.168.2.254",
+        "SharingNetworkMask": "255.255.255.0",
+    }
+}
+dest.write_bytes(plistlib.dumps(data, fmt=plistlib.FMT_XML))
+PY
+}
+
+install_daemon() {
+  if [ "$(id -u)" -ne 0 ]; then
+    return 1
+  fi
+  mkdir -p "$INSTALL_DIR"
+  local src
+  src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  cp "$src" "$INSTALL_BIN"
+  chown root:wheel "$INSTALL_BIN"
+  chmod 755 "$INSTALL_BIN"
+  cat > "$DAEMON_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${DAEMON_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${INSTALL_BIN}</string>
+    <string>service</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>UserName</key>
+  <string>root</string>
+  <key>StandardOutPath</key>
+  <string>${CONFIG_DIR}/logs/eli-internet-root.log</string>
+  <key>StandardErrorPath</key>
+  <string>${CONFIG_DIR}/logs/eli-internet-root.log</string>
+</dict>
+</plist>
+EOF
+  chown root:wheel "$DAEMON_PLIST"
+  chmod 644 "$DAEMON_PLIST"
+  launchctl bootout system/"$DAEMON_LABEL" >/dev/null 2>&1 || true
+  launchctl bootstrap system "$DAEMON_PLIST" >/dev/null 2>&1 || launchctl load -w "$DAEMON_PLIST" >/dev/null 2>&1 || true
+  log "installed Eli-internet helper"
+}
+
+start_sharing() {
+  # Internet Sharing restarts the Wi-Fi radio and never creates the bridge
+  # the other computer can use. DHCP is answered directly on ap1.
+  launchctl enable system/com.apple.bootpd >/dev/null 2>&1 || true
+  launchctl kickstart -k system/com.apple.bootpd >/dev/null 2>&1 || true
+  launchctl disable "$SHARING_LABEL" >/dev/null 2>&1 || true
+  stop_sharing
+}
+
+stop_sharing() {
+  /usr/bin/notifyutil -p com.apple.Networking.InternetSharing.stop >/dev/null 2>&1 || true
+  launchctl kill SIGTERM "$SHARING_LABEL" >/dev/null 2>&1 || true
+  launchctl stop com.apple.NetworkSharing >/dev/null 2>&1 || true
+  killall InternetSharing >/dev/null 2>&1 || true
+}
+
+write_bootpd_plist() {
+  cat > /etc/bootpd.plist <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>bootp_enabled</key>
+	<false/>
+	<key>dhcp_enabled</key>
+	<array>
+		<string>ap1</string>
+		<string>bridge100</string>
+		<string>en0</string>
+	</array>
+	<key>netboot_enabled</key>
+	<false/>
+	<key>Subnets</key>
+	<array>
+		<dict>
+			<key>allocate</key>
+			<true/>
+			<key>lease_max</key>
+			<integer>86400</integer>
+			<key>name</key>
+			<string>192.168.2</string>
+			<key>net_address</key>
+			<string>192.168.2.0</string>
+			<key>net_mask</key>
+			<string>255.255.255.0</string>
+			<key>net_range</key>
+			<array>
+				<string>192.168.2.2</string>
+				<string>192.168.2.254</string>
+			</array>
+			<key>dhcp_router</key>
+			<string>192.168.2.1</string>
+			<key>dhcp_domain_name_server</key>
+			<array>
+				<string>192.168.2.1</string>
+			</array>
+			<key>server_ip</key>
+			<string>192.168.2.1</string>
+		</dict>
+	</array>
+</dict>
+</plist>
+EOF
+}
+
+stream_active() {
+  # Sunshine logs a new session when the picture starts, and a disconnect
+  # when the controlling computer stops. The phone internet is shared only
+  # until that picture starts.
+  pgrep -x Sunshine >/dev/null 2>&1 || return 1
+  local line
+  line="$(grep -E 'New streaming session started|CLIENT DISCONNECTED' "$HOME_DIR/.config/sunshine/sunshine.log" 2>/dev/null | tail -1)"
+  case "$line" in
+    *"New streaming session started"*) return 0 ;;
+  esac
+  return 1
+}
+
+lan_routes() {
+  # Forwarding has to stay on. Turning it off removes the route the mouse
+  # and the picture use, and the stream drops on the first move.
+  /usr/sbin/sysctl -w net.inet.ip.forwarding=1 >/dev/null 2>&1 || true
+  /sbin/route -n add -host 255.255.255.255 -interface ap1 >/dev/null 2>&1 || true
+  # A second mDNS route on the phone cable makes the mouse connection fail
+  # with "no route to host" even when the hotspot route also exists.
+  /sbin/route -n delete -host 224.0.0.251 -ifscope en7 >/dev/null 2>&1 || true
+  /sbin/route -n delete -net 224.0.0.0/4 -ifscope en7 >/dev/null 2>&1 || true
+  /sbin/route -n add -host 224.0.0.251 -interface ap1 >/dev/null 2>&1 || true
+}
+
+unshare_clients() {
+  # Stop the other computer using the phone cable, but leave forwarding on
+  # so the stream and the mouse stay on Eli-internet.
+  lan_routes
+  cat > "$CONFIG_DIR/eli-nat.pf" <<'EOF'
+block drop out quick on en7 inet from 192.168.2.0/24 to any
+pass in quick all
+pass out quick all
+EOF
+  /sbin/pfctl -f "$CONFIG_DIR/eli-nat.pf" >/dev/null 2>&1 || return 1
+  /sbin/pfctl -e >/dev/null 2>&1 || true
+}
+
+share_clients() {
+  # Computers on Eli-internet only need this Mac, but macOS and Chrome drop
+  # a Wi-Fi network that has no internet and show ERR_INTERNET_DISCONNECTED.
+  # Forward them out the phone cable until the picture starts.
+  lan_routes
+  cat > "$CONFIG_DIR/eli-nat.pf" <<'EOF'
+nat on en7 inet from 192.168.2.0/24 to any -> (en7)
+pass in quick all
+pass out quick all
+EOF
+  /sbin/pfctl -f "$CONFIG_DIR/eli-nat.pf" >/dev/null 2>&1 || return 1
+  /sbin/pfctl -e >/dev/null 2>&1 || true
+}
+
+ensure_dhcp() {
+  if pgrep -f "$BIN/eli-dhcp.py" >/dev/null 2>&1; then
+    return 0
+  fi
+  # bootpd exits as soon as it is idle, so the other computer never gets an address.
+  launchctl bootout system/com.apple.bootpd >/dev/null 2>&1 || true
+  killall bootpd >/dev/null 2>&1 || true
+  sleep 0.3
+  /usr/bin/python3 "$BIN/eli-dhcp.py" >>"$CONFIG_DIR/logs/eli-dhcp.log" 2>&1 &
+  log "DHCP is answering on 192.168.2.1"
+}
+
+assign_lan() {
+  # Host-AP traffic arrives on ap1. en0 stays inactive in that mode, so an
+  # address left on en0 never answers DHCP.
+  if ifconfig ap1 >/dev/null 2>&1; then
+    local i
+    for i in 1 2 3 4 5 6 7 8; do
+      if ifconfig ap1 2>/dev/null | grep -q "status: active"; then
+        break
+      fi
+      sleep 0.5
+    done
+    # A bridge on ap1 swallows DHCP before the other computer can get an address.
+    ifconfig bridge100 deletem ap1 >/dev/null 2>&1 || true
+    ifconfig bridge100 inet 192.168.2.1 delete >/dev/null 2>&1 || true
+    ifconfig bridge100 destroy >/dev/null 2>&1 || true
+    ifconfig ap1 inet 192.168.2.1 netmask 255.255.255.0 alias >/dev/null 2>&1 || \
+      ifconfig ap1 inet 192.168.2.1 netmask 255.255.255.0 >/dev/null 2>&1 || true
+    ifconfig en0 inet 192.168.2.1 delete >/dev/null 2>&1 || true
+  else
+    ifconfig en0 inet 192.168.2.1 netmask 255.255.255.0 alias >/dev/null 2>&1 || \
+      ifconfig en0 inet 192.168.2.1 netmask 255.255.255.0 >/dev/null 2>&1 || true
+  fi
+  write_bootpd_plist
+  ensure_dhcp
+}
+
+configure_ap() {
+  write_nat_plist
+  cp "$CONFIG_DIR/com.apple.nat.eli-internet.plist" "$NAT_PLIST"
+  chown root:wheel "$NAT_PLIST"
+  chmod 644 "$NAT_PLIST"
+  ifconfig bridge0 up >/dev/null 2>&1 || true
+  assign_lan
+  touch "$WANT" "$OWNED"
+  chown boys:staff "$WANT" 2>/dev/null || true
+}
+
+wait_ap() {
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if ap_up; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+sunshine_follow_display() {
+  # A closed lid keeps the same laptop screen. Quitting Sunshine to chase
+  # another screen is what dropped the connection.
+  return 0
+}
+
+share() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "Eli-internet share must run as root." >&2
+    return 1
+  fi
+  local missing=0
+  local sharing=1
+  while [ -f "$WANT" ]; do
+    stay_awake
+    if ap_up; then
+      if [ "$missing" -eq 1 ]; then
+        log "brought Eli-internet back after the radio dropped"
+      fi
+      missing=0
+      if ! ifconfig ap1 2>/dev/null | grep -q "inet 192.168.2.1"; then
+        assign_lan
+        log "put 192.168.2.1 on the hotspot interface"
+      else
+        ensure_dhcp
+        lan_routes
+        sunshine_follow_display
+        # This Mac keeps the phone cable. Other computers only get Eli-internet,
+        # not a route onto the phone.
+        unshare_clients || true
+        sharing=0
+      fi
+    else
+      missing=1
+      log "Eli-internet radio dropped; starting it again"
+      load_settings
+      if prefer_usb_route; then
+        if [ -x "$BIN/eli-host" ]; then
+          "$BIN/eli-host" start "$SSID" "$PASSWORD" >/dev/null 2>&1 || true
+        fi
+        assign_lan
+      else
+        log "left Wi-Fi alone because the phone cable was not ready"
+      fi
+    fi
+    sleep 4
+  done
+  log "Eli-internet helper idle"
+}
+
+stay_awake() {
+  # disablesleep alone still lets the lid turn the Wi-Fi radio off.
+  # sleep 0 is what keeps a closed lid from sleeping this Mac.
+  /usr/bin/pmset -a disablesleep 1 >/dev/null 2>&1 || true
+  /usr/bin/pmset -a sleep 0 >/dev/null 2>&1 || true
+  /usr/bin/pmset -a displaysleep 0 >/dev/null 2>&1 || true
+  /usr/bin/pmset -a lowpowermode 0 >/dev/null 2>&1 || true
+  if [ -x "$BIN/eli-clamshell-awake" ]; then
+    "$BIN/eli-clamshell-awake" >/dev/null 2>&1 || true
+  fi
+}
+
+allow_sleep() {
+  /usr/bin/pmset -a disablesleep 0 >/dev/null 2>&1 || true
+  /usr/bin/pmset -a sleep 1 >/dev/null 2>&1 || true
+}
+
+bring_up() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "Eli-internet start must run as root." >&2
+    return 1
+  fi
+  load_settings
+  write_status starting
+  if ! prefer_usb_route; then
+    log "left Wi-Fi alone because the phone cable was not ready"
+    echo "The phone cable is not ready, so Wi-Fi was left as it is."
+    write_status cable
+    return 1
+  fi
+  write_nat_plist
+  if [ ! -x "$BIN/eli-host" ]; then
+    echo "Eli-internet could not start, so Wi-Fi was left as it is."
+    restore_house_route
+    write_status failed
+    return 1
+  fi
+  log "starting Eli-internet from the phone cable"
+  stop_sharing
+  ifconfig awdl0 down >/dev/null 2>&1 || true
+  ifconfig llw0 down >/dev/null 2>&1 || true
+  if ap_up; then
+    log "Eli-internet radio is already up"
+  elif ! "$BIN/eli-host" start "$SSID" "$PASSWORD"; then
+    if ap_up; then
+      log "Eli-internet radio is up"
+    else
+      "$BIN/eli-host" stop >/dev/null 2>&1 || true
+      log "Eli-internet radio did not start; Wi-Fi left to reconnect"
+      echo "Eli-internet did not start, so it was turned back off."
+      write_status failed
+      restore_house_route
+      local dev
+      dev="$(wifi_device)"
+      [ -n "$dev" ] || dev="en0"
+      /usr/sbin/networksetup -setairportpower "$dev" on >/dev/null 2>&1 || true
+      return 1
+    fi
+  fi
+  configure_ap
+  log "answering DHCP on the hotspot interface"
+  start_sharing
+  if wait_ap; then
+    prefer_usb_route || true
+    unshare_clients || true
+    stay_awake
+    log "Eli-internet stays on with the lid closed"
+    log "Eli-internet is on (${SSID})"
+    echo "Local Wi-Fi ${SSID} is on."
+    echo "On the other computer join Wi-Fi \"${SSID}\"  password ${PASSWORD}"
+    echo "Then open ${WEB_URL}"
+    write_status on
+    return 0
+  else
+    log "Eli-internet did not come up; stopping so Wi-Fi can return"
+  fi
+  shut_down
+  echo "Eli-internet did not stay up, so it was turned back off."
+  return 1
+}
+
+start_ap() {
+  install_daemon || true
+  bring_up
+}
+
+shut_down() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "Eli-internet stop must run as root." >&2
+    return 1
+  fi
+  rm -f "$WANT" "$OWNED" "$SWITCH"
+  if [ -x "$BIN/eli-host" ]; then
+    "$BIN/eli-host" stop >/dev/null 2>&1 || true
+  fi
+  ifconfig ap1 inet 192.168.2.1 delete >/dev/null 2>&1 || true
+  ifconfig en0 inet 192.168.2.1 delete >/dev/null 2>&1 || true
+  ifconfig bridge100 inet 192.168.2.1 delete >/dev/null 2>&1 || true
+  ifconfig bridge100 destroy >/dev/null 2>&1 || true
+  stop_sharing
+  killall bootpd >/dev/null 2>&1 || true
+  pkill -f "$BIN/eli-dhcp.py" >/dev/null 2>&1 || true
+  /usr/bin/defaults write /Library/Preferences/SystemConfiguration/com.apple.nat NAT -dict-add Enabled -int 0 >/dev/null 2>&1 || true
+  restore_house_route
+  /usr/sbin/sysctl -w net.inet.ip.forwarding=0 >/dev/null 2>&1 || true
+  /sbin/pfctl -d >/dev/null 2>&1 || true
+  allow_sleep
+  log "Eli-internet stopped"
+  write_status off
+  echo "Eli-internet is off. This Mac can sleep again."
+}
+
+stop_ap() {
+  launchctl bootout system/"$DAEMON_LABEL" >/dev/null 2>&1 || true
+  sleep 1
+  shut_down
+}
+
+service() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "Eli-internet service must run as root." >&2
+    return 1
+  fi
+  printf '%s\n' "$$" >"$PIDFILE"
+  chmod 644 "$PIDFILE" 2>/dev/null || true
+  load_settings
+  log "Eli-internet buttons are ready"
+  while true; do
+    if [ -f "$SWITCH" ]; then
+      cmd="$(head -1 "$SWITCH" 2>/dev/null || true)"
+      rm -f "$SWITCH"
+      case "$cmd" in
+        start) bring_up || true ;;
+        stop) shut_down || true ;;
+      esac
+    fi
+    if [ -f "$WANT" ]; then
+      stay_awake
+      if ap_up; then
+        if ! ifconfig ap1 2>/dev/null | grep -q "inet 192.168.2.1"; then
+          assign_lan
+        else
+          ensure_dhcp
+          lan_routes
+          sunshine_follow_display
+          unshare_clients || true
+        fi
+      else
+        log "Eli-internet radio dropped; starting it again"
+        load_settings
+        if prefer_usb_route; then
+          if [ -x "$BIN/eli-host" ]; then
+            "$BIN/eli-host" start "$SSID" "$PASSWORD" >/dev/null 2>&1 || true
+          fi
+          assign_lan
+        else
+          log "left Wi-Fi alone because the phone cable was not ready"
+        fi
+      fi
+    fi
+    sleep 2
+  done
+}
+
+case "${1:-start}" in
+  start) start_ap ;;
+  stop) stop_ap ;;
+  service) service ;;
+  share) share ;;
+  lan) assign_lan ;;
+  install) install_daemon ;;
+  clients)
+    unshare_clients || exit 1
+    pkill -9 -f "$BIN/eli-dhcp.py" >/dev/null 2>&1 || true
+    sleep 0.3
+    launchctl bootout system/com.apple.bootpd >/dev/null 2>&1 || true
+    killall bootpd >/dev/null 2>&1 || true
+    /usr/bin/python3 "$BIN/eli-dhcp.py" >>"$CONFIG_DIR/logs/eli-dhcp.log" 2>&1 &
+    log "other computers are not given the phone internet"
+    echo "Other computers can reach this Mac. They are not given the phone internet."
+    ;;
+  status)
+    if ap_up; then
+      echo "eli-internet on"
+    else
+      echo "eli-internet off"
+    fi
+    ;;
+  *)
+    echo "usage: $0 start|stop|share|status" >&2
+    exit 1
+    ;;
+esac

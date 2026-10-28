@@ -1,0 +1,56 @@
+#!/bin/bash
+set -euo pipefail
+
+UID_NUM="$(id -u)"
+LABEL="gui/${UID_NUM}/dev.moonlight.web"
+BIN="$HOME/.config/moonlight-web/bin"
+
+launchctl bootout "$LABEL" >/dev/null 2>&1 || true
+pkill -f "$HOME/.config/moonlight-web/streamer" >/dev/null 2>&1 || true
+pkill -f "$HOME/.config/moonlight-web/web-server" >/dev/null 2>&1 || true
+
+# AppleScript quit can sit forever, so stop waiting after a few seconds.
+osascript -e 'tell application "Sunshine" to quit' >/dev/null 2>&1 &
+quit_pid=$!
+for _ in 1 2 3 4 5; do
+  if ! pgrep -x Sunshine >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+kill "$quit_pid" >/dev/null 2>&1 || true
+pkill -x Sunshine >/dev/null 2>&1 || true
+osascript -e 'tell application "System Events" to delete login item "Sunshine"' >/dev/null 2>&1 &
+login_pid=$!
+sleep 2
+kill "$login_pid" >/dev/null 2>&1 || true
+
+if [ -x "$HOME/.config/sunshine/keep-lid-awake" ]; then
+  "$HOME/.config/sunshine/keep-lid-awake" stop >/dev/null 2>&1 || true
+fi
+
+if [ -x "$HOME/.config/sunshine/stream-session.sh" ]; then
+  "$HOME/.config/sunshine/stream-session.sh" stop >/dev/null 2>&1 || true
+fi
+
+if [ -x "$BIN/nearby-link" ]; then
+  "$BIN/nearby-link" stop >/dev/null 2>&1 || true
+fi
+pkill -f "$BIN/ipv6-listen" >/dev/null 2>&1 || true
+rm -f "$HOME/.config/moonlight-web/ipv6-listen.pid"
+if [ -x "$BIN/lan-dns-ctl" ]; then
+  "$BIN/lan-dns-ctl" stop >/dev/null 2>&1 || true
+fi
+if [ -x "$BIN/direct-link" ]; then
+  "$BIN/direct-link" stop >/dev/null 2>&1 || true
+fi
+if [ -x "$BIN/net-fallback" ]; then
+  "$BIN/net-fallback" stop >/dev/null 2>&1 || true
+fi
+if [ -x "$BIN/wifi-link" ]; then
+  "$BIN/wifi-link" stop >/dev/null 2>&1 || true
+fi
+ifconfig awdl0 down >/dev/null 2>&1 || true
+ifconfig llw0 down >/dev/null 2>&1 || true
+
+echo "Stream is off."

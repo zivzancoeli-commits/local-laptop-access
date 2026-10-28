@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Read a plain-text login file and update moonlight-web's stored password hash."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import secrets
+import sys
+
+LOGIN_PATH = os.path.expanduser("~/Desktop/Stream/login.txt")
+DATA_PATH = os.path.expanduser("~/.config/moonlight-web/server/data.json")
+WELOGIN_PATH = os.path.expanduser("~/.config/moonlight-web/web-login")
+ITERATIONS = 600_000
+
+
+def parse_login(path: str) -> tuple[str, str]:
+    username = ""
+    password = ""
+    with open(path, encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip().lower()
+            value = value.strip()
+            if key in ("username", "user", "name"):
+                username = value
+            elif key in ("password", "pin", "pass"):
+                password = value
+    if not username:
+        raise SystemExit(f"No username in {path}")
+    if not password:
+        raise SystemExit(f"No password in {path}")
+    return username, password
+
+
+def hash_password(password: str) -> dict:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, ITERATIONS, dklen=32)
+    return {
+        "salt": salt.hex(),
+        "hash": digest.hex(),
+        "iterations": ITERATIONS,
+    }
+
+
+def main() -> None:
+    path = sys.argv[1] if len(sys.argv) > 1 else LOGIN_PATH
+    if not os.path.isfile(path):
+        raise SystemExit(f"Login file not found: {path}")
+
+    username, password = parse_login(path)
+
+    with open(DATA_PATH, encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    users = data.get("users") or {}
+    if not users:
+        raise SystemExit(f"No users found in {DATA_PATH}")
+
+    user_id = next(iter(users))
+    users[user_id]["name"] = username
+    users[user_id]["password"] = hash_password(password)
+    if not users[user_id].get("client_unique_id"):
+        users[user_id]["client_unique_id"] = username
+
+    tmp = DATA_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+        handle.write("\n")
+    os.replace(tmp, DATA_PATH)
+
+    with open(WELOGIN_PATH, "w", encoding="utf-8") as handle:
+        handle.write(f"WEB_USER={username}\nWEB_PIN={password}\n")
+    os.chmod(WELOGIN_PATH, 0o600)
+
+    print(f"Login updated for user '{username}'")
+
+
+if __name__ == "__main__":
+    main()

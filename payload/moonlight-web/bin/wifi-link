@@ -1,0 +1,256 @@
+#!/bin/bash
+# Host a local Wi-Fi named Eli-internet when this Mac is not on house Wi-Fi.
+# The controlling computer joins it and talks to this Mac directly.
+set -u
+
+DIR="$HOME/.config/moonlight-web"
+BIN="$DIR/bin"
+RUN="$DIR/wifi-link.run"
+STATE="$DIR/wifi-link.state"
+WATCH_PID="$DIR/wifi-link.watch.pid"
+CLIENT="$DIR/wifi-link.client"
+WANT="$DIR/wifi-link.want"
+OWNED="$DIR/wifi-link.owned"
+CMDFILE="$DIR/wifi-link.cmd"
+ASKED="$DIR/wifi-link.asked"
+HELPER="$BIN/Eli-internet.app"
+ROOT="$BIN/eli-internet-root"
+INSTALLED_ROOT="/Library/Application Support/moonlight-web/eli-internet-root"
+LOG="$DIR/logs/wifi-link.log"
+# shellcheck disable=SC1091
+. "$DIR/bin/load-host-settings.sh"
+
+mkdir -p "$DIR/logs"
+
+log() {
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG"
+}
+
+wifi_device() {
+  /usr/sbin/networksetup -listallhardwareports 2>/dev/null | awk '
+    /Wi-Fi|AirPort/ { getline; print $2; exit }
+  '
+}
+
+ap_up() {
+  if [ -x "$BIN/eli-host" ] && "$BIN/eli-host" roles 2>/dev/null | grep -Eq "default name=en0 mode=3|role1 name=en0 mode=3|role3 name=ap1 mode=3"; then
+    return 0
+  fi
+  if ifconfig ap1 2>/dev/null | grep -q "inet 192.168.2." \
+    && ifconfig ap1 2>/dev/null | grep -q "status: active" \
+    && ifconfig en0 2>/dev/null | grep -q "status: inactive"; then
+    return 0
+  fi
+  return 1
+}
+
+daemon_ok() {
+  launchctl print system/dev.moonlight.eli-internet >/dev/null 2>&1
+}
+
+daemon_stale() {
+  if [ ! -x "$INSTALLED_ROOT" ] || [ ! -x "$ROOT" ]; then
+    return 0
+  fi
+  ! cmp -s "$ROOT" "$INSTALLED_ROOT"
+}
+
+house_wifi_up() {
+  local dev power ip
+  dev="$(wifi_device)"
+  [ -n "$dev" ] || dev="en0"
+  power="$(/usr/sbin/networksetup -getairportpower "$dev" 2>/dev/null || true)"
+  if printf '%s\n' "$power" | grep -qi ': Off'; then
+    return 1
+  fi
+  ip="$(ipconfig getifaddr "$dev" 2>/dev/null || true)"
+  if [ -z "${ip:-}" ]; then
+    return 1
+  fi
+  case "$ip" in
+    169.254.*|192.168.2.*|10.0.99.*) return 1 ;;
+  esac
+  return 0
+}
+
+needed() {
+  # Hosting Eli-internet on this Mac takes the only Wi-Fi radio and drops
+  # the hotspot. Never do that automatically.
+  rm -f "$WANT" 2>/dev/null || true
+  echo no
+}
+
+needs_admin() {
+  if [ "$(needed)" != "yes" ]; then
+    echo no
+    return 0
+  fi
+  if daemon_ok && ! daemon_stale; then
+    echo no
+    return 0
+  fi
+  echo yes
+}
+
+save_current_wifi() {
+  local net
+  net="$(/usr/sbin/networksetup -getairportnetwork "$(wifi_device || echo en0)" 2>/dev/null | sed -n 's/^Current Wi-Fi Network: //p' || true)"
+  if [ -n "${net:-}" ] && [ "$net" != "You are not associated with an AirPort network." ] && [ "$net" != "$SSID" ]; then
+    printf 'PREV_WIFI=%q\n' "$net" > "$STATE"
+  fi
+}
+
+stop_watch() {
+  if [ -f "$WATCH_PID" ]; then
+    pid="$(cat "$WATCH_PID" 2>/dev/null || true)"
+    if [ -n "${pid:-}" ]; then
+      kill "$pid" >/dev/null 2>&1 || true
+    fi
+    rm -f "$WATCH_PID"
+  fi
+  pkill -f "$BIN/wifi-link watch" >/dev/null 2>&1 || true
+}
+
+start_watch() {
+  if pgrep -f "$BIN/wifi-link watch" >/dev/null 2>&1; then
+    return 0
+  fi
+  nohup "$BIN/wifi-link" watch >>"$LOG" 2>&1 &
+  echo $! > "$WATCH_PID"
+  disown $! >/dev/null 2>&1 || true
+}
+
+ask_admin() {
+  local cmd="${1:-start}"
+  printf '%s\n' "$cmd" > "$CMDFILE"
+  if [ -d "$HELPER" ]; then
+    open -a "$HELPER"
+    return 0
+  fi
+  return 1
+}
+
+wait_ap() {
+  local i
+  for i in $(seq 1 30); do
+    if ap_up; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+start_now() {
+  touch "$RUN" "$WANT"
+  python3 "$BIN/write-nat-plist" "$DIR/com.apple.nat.eli-internet.plist" >/dev/null 2>&1 || true
+  if ap_up; then
+    return 0
+  fi
+  if [ "$(id -u)" -eq 0 ]; then
+    "$ROOT" start
+    return $?
+  fi
+  if sudo -n true >/dev/null 2>&1; then
+    sudo -n "$ROOT" start
+    return $?
+  fi
+  if daemon_ok && ! daemon_stale; then
+    wait_ap
+    return 0
+  fi
+  local age=9999
+  if [ -f "$ASKED" ]; then
+    age="$(( $(date +%s) - $(stat -f %m "$ASKED" 2>/dev/null || echo 0) ))"
+  fi
+  if [ "$age" -lt 90 ]; then
+    log "waiting for password prompt already shown"
+    return 0
+  fi
+  date +%s > "$ASKED"
+  log "asking this Mac for its password so Eli-internet can start"
+  ask_admin start
+  return 0
+}
+
+prepare() {
+  mkdir -p "$DIR/logs"
+  save_current_wifi
+  python3 "$BIN/write-nat-plist" "$DIR/com.apple.nat.eli-internet.plist" >/dev/null
+  touch "$RUN" "$WANT"
+}
+
+watch() {
+  log "watching; leaving the current Wi-Fi or hotspot connected"
+  rm -f "$CLIENT" "$WANT"
+  while [ -f "$RUN" ]; do
+    rm -f "$WANT" 2>/dev/null || true
+    sleep 5
+  done
+  log "watch stopped"
+}
+
+ensure() {
+  touch "$RUN"
+  if house_wifi_up && [ ! -f "$STATE" ]; then
+    save_current_wifi
+  fi
+  start_watch
+  if [ "$(needed)" = "yes" ]; then
+    start_now || true
+  fi
+  if ap_up; then
+    echo "Local Wi-Fi is on."
+    echo "On the other computer join Wi-Fi \"${SSID}\"  password ${PASSWORD}"
+    echo "Then open ${WEB_URL}"
+  fi
+}
+
+start() {
+  rm -f "$WANT"
+  echo "This Mac stays on its current Wi-Fi or hotspot."
+  echo "Keep the other computer on that same network, then Show Link."
+}
+
+stop() {
+  stop_watch
+  rm -f "$RUN" "$CLIENT" "$WANT" "$ASKED"
+}
+
+status() {
+  if ap_up; then
+    echo "wifi-link on"
+    echo "ssid ${SSID}"
+    echo "password ${PASSWORD}"
+  else
+    echo "wifi-link off"
+  fi
+  if [ -f "$CLIENT" ]; then
+    echo "controller joined"
+  else
+    echo "controller waiting"
+  fi
+  ifconfig bridge100 2>/dev/null | awk '/inet /{print "ap",$2}' || true
+  python3 "$BIN/wifi-link-net" wan-list 2>/dev/null || true
+}
+
+still_up() {
+  if ap_up; then
+    echo yes
+  else
+    echo no
+  fi
+}
+
+case "${1:-start}" in
+  start) start ;;
+  stop) stop; echo "local Wi-Fi stopped" ;;
+  watch) watch ;;
+  ensure) ensure ;;
+  prepare) prepare ;;
+  needed) needed ;;
+  needs-admin) needs_admin ;;
+  still-up) still_up ;;
+  status) status ;;
+  *) echo "usage: $0 start|stop|status|needed" >&2; exit 1 ;;
+esac
