@@ -1,10 +1,16 @@
-# host-internet
+# Local Laptop Access
 
-One computer runs the games and makes its own Wi-Fi. The other computer joins that Wi-Fi, opens a web page, and plays with its keyboard and mouse. The other computer can be a Windows laptop or an Apple laptop. It does not install anything.
+This allows you to access your computer from another computer (like a Chromebook) so it's almost like you have the power of your MacBook on your Chromebook.
+
+## Required materials
+You need:
+- Laptop
+- iPhone (hasn't been tested with an android)
+- USB-C cable (maybe other) that can transmit data so the host computer can have internet access
 
 ## Set it up
 
-On the Apple laptop that will run the games, paste this into Terminal:
+If you're hosting on an Apple laptop, paste this into Terminal:
 
 ```
 git clone https://github.com/zivzancoeli-commits/host-internet.git "$HOME/host-internet" && open "$HOME/host-internet/Setup.command"
@@ -12,7 +18,7 @@ git clone https://github.com/zivzancoeli-commits/host-internet.git "$HOME/host-i
 
 If the Mac asks to install the command line tools, click Install, wait until that finishes, and paste the command again. Those tools are only there so `git` can download this folder. Setup itself downloads Sunshine, then asks for the Wi-Fi name, the Wi-Fi password, the website username, the website password, and the address.
 
-On the Windows laptop that will run the games, paste this into PowerShell:
+On a Windows laptop that hose, paste this into PowerShell:
 
 ```
 git clone https://github.com/zivzancoeli-commits/host-internet.git "$env:USERPROFILE\host-internet"; Start-Process "$env:USERPROFILE\host-internet\Setup.bat"
